@@ -16,6 +16,6 @@ resource "aws_s3_bucket" "main" {
 
   tags = {
     Name    = "github-actions-terraform-lab"
-    Project = "Project3"
+    Project = "project3"
   }
 }

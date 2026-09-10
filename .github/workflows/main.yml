@@ -37,7 +37,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
       
       - name: Debug role ARN
-        run: echo "${{ vars.AWS_ROLE_ARN }}"
+        run: echo "${{ vars.IAM_ROLE_ARN }}"
 
       - name: Terraform Format Check
         run: terraform fmt -check
