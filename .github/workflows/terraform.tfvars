@@ -1,0 +1,1 @@
+bucket_name = "itsuki-github-actions-terraform-lab-2026"
