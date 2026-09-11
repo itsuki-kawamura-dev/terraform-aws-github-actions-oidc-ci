@@ -1,42 +1,39 @@
 # Terraform AWS CI/CD with GitHub Actions and OIDC
 
-A hands-on Terraform project demonstrating how to deploy AWS infrastructure from GitHub Actions using OpenID Connect (OIDC) authentication.
+A hands-on Terraform project demonstrating AWS infrastructure deployment from GitHub Actions using OpenID Connect (OIDC) authentication.
 
-The workflow authenticates to AWS without storing long-lived AWS access keys in GitHub, assumes an IAM role through AWS STS, validates the Terraform configuration, generates a plan, and applies the infrastructure.
+The workflow authenticates to AWS without storing long-lived AWS access keys in GitHub. GitHub Actions requests an OIDC JSON Web Token (JWT), AWS STS validates the token against an IAM role trust policy, and Terraform receives temporary AWS credentials to manage infrastructure.
 
-This lab deploys an Amazon S3 bucket as a simple target resource.
+The lab uses an Amazon S3 bucket as the deployment target and an S3 remote backend to persist Terraform state between ephemeral GitHub-hosted runners.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     A[Git Push / Pull Request] --> B[GitHub Actions]
+    B -->|OIDC JWT| C[AWS STS]
+    C -->|AssumeRoleWithWebIdentity| D[IAM Role]
+    D --> E[Terraform]
 
-    B --> C[GitHub OIDC Provider]
-    C --> D[AWS STS]
-    D --> E[IAM Role]
+    E -->|terraform init / read & write state| F[S3 Remote Backend]
+    E -->|terraform plan / apply| G[Target S3 Bucket]
 
-    E --> F[Terraform]
-
-    F --> G[terraform fmt]
-    F --> H[terraform init]
-    F --> I[terraform validate]
-    F --> J[terraform plan]
-    F --> K[terraform apply]
-
-    K --> L[Amazon S3]
+    F --> H[S3 Versioning]
 ```
 
 ## What This Project Demonstrates
 
 - Terraform infrastructure provisioning
-- GitHub Actions CI/CD workflow
+- GitHub Actions CI/CD
 - GitHub OIDC authentication with AWS
 - AWS STS `AssumeRoleWithWebIdentity`
 - IAM trust policies for GitHub Actions
-- AWS authentication without long-lived access keys
-- Automated Terraform validation, planning, and deployment
-- S3 provisioning through Terraform
+- Temporary AWS credentials instead of long-lived access keys
+- Terraform `fmt`, `init`, `validate`, `plan`, and `apply`
+- Terraform remote state with an S3 backend
+- S3 Versioning for state history and recovery
+- Troubleshooting OIDC authentication by inspecting JWT claims
+- Troubleshooting Terraform state persistence in ephemeral CI runners
 
 ## Repository Structure
 
@@ -48,9 +45,11 @@ flowchart LR
 │
 ├── IAM_precreated/
 │   ├── IAM_OIDC.tf
+│   ├── backend_s3.tf
 │   └── output.tf
 │
 ├── terraform/
+│   ├── backend.tf
 │   ├── main.tf
 │   ├── variables.tf
 │   └── terraform.tfvars
@@ -58,23 +57,47 @@ flowchart LR
 └── README.md
 ```
 
-### `IAM_precreated/`
+## Bootstrap Design
 
-Contains the bootstrap configuration for the GitHub OIDC provider and IAM role.
+OIDC authentication and remote state both introduce bootstrap dependencies.
 
-This configuration must initially be applied outside GitHub Actions because the workflow cannot assume an IAM role until the OIDC provider and trust relationship already exist.
+GitHub Actions cannot assume the deployment IAM role until the GitHub OIDC provider and IAM role already exist. Likewise, Terraform cannot use an S3 backend until the backend bucket already exists.
 
-### `terraform/`
+Therefore, the resources under `IAM_precreated/` are created first from an already authenticated local Terraform environment.
 
-Contains the infrastructure deployed by the GitHub Actions workflow.
+The bootstrap layer creates:
 
-The current lab deploys an S3 bucket.
+- GitHub OIDC provider
+- GitHub Actions IAM role and trust policy
+- S3 bucket for Terraform remote state
+- S3 Versioning for state history
 
-## Authentication Flow
+```text
+Local authenticated environment
+        |
+        v
+Bootstrap Terraform
+        |
+        +--> GitHub OIDC Provider
+        +--> GitHub Actions IAM Role
+        +--> Terraform State S3 Bucket
+                    |
+                    +--> Versioning enabled
+
+After bootstrap
+        |
+        v
+GitHub Actions --> OIDC --> AWS STS --> IAM Role --> Terraform
+                                              |
+                                              +--> Remote State S3
+                                              +--> Target AWS Resources
+```
+
+The bootstrap state itself is separate from the state used by the GitHub Actions-managed infrastructure.
+
+## OIDC Authentication Flow
 
 The project does not store an AWS Access Key ID or Secret Access Key in GitHub.
-
-Instead, authentication works as follows:
 
 ```text
 GitHub Actions
@@ -94,12 +117,9 @@ IAM Role
       | temporary AWS credentials
       v
 Terraform
-      |
-      v
-AWS resources
 ```
 
-GitHub Actions requires the following permission to request an OIDC token:
+GitHub Actions requires permission to request an OIDC token:
 
 ```yaml
 permissions:
@@ -107,7 +127,7 @@ permissions:
   contents: read
 ```
 
-The AWS credential action then exchanges the GitHub OIDC identity for temporary AWS credentials:
+The AWS credentials action then exchanges the GitHub identity for temporary AWS credentials:
 
 ```yaml
 - name: Configure AWS credentials
@@ -117,17 +137,19 @@ The AWS credential action then exchanges the GitHub OIDC identity for temporary 
     aws-region: ${{ env.AWS_REGION }}
 ```
 
+`IAM_ROLE_ARN` is configured as a GitHub repository variable so that the AWS account-specific ARN does not need to be committed to the public repository.
+
 ## IAM Trust Policy
 
-The IAM role trusts GitHub's OIDC provider and allows:
+The IAM role trusts GitHub's OIDC provider and permits:
 
 ```text
 sts:AssumeRoleWithWebIdentity
 ```
 
-The trust policy validates both the OIDC audience and subject.
+The trust relationship validates both the token audience and subject.
 
-Example:
+Example with public placeholders:
 
 ```hcl
 Condition = {
@@ -141,19 +163,110 @@ Condition = {
 }
 ```
 
-The repository and owner IDs are stable identifiers used by GitHub's OIDC subject format.
+Repository-specific identifiers are intentionally represented with placeholders in this public repository.
 
-This prevents unrelated GitHub repositories from assuming the IAM role.
+## Terraform Remote State
+
+GitHub-hosted runners are ephemeral. A local `terraform.tfstate` created during one workflow run is not available to the next runner.
+
+Without persistent state, a later run may incorrectly plan to recreate resources that already exist in AWS:
+
+```text
+First workflow run
+Terraform creates resource
+        |
+        v
+Local state exists only on runner
+        |
+        v
+Runner terminates
+        |
+        v
+Local state is lost
+
+Next workflow run
+Terraform sees no state
+        |
+        v
+Plan: resource will be created
+        |
+        v
+AWS: resource already exists
+```
+
+During this lab, this behavior produced an S3 error:
+
+```text
+Plan: 1 to add, 0 to change, 0 to destroy
+
+BucketAlreadyOwnedByYou
+StatusCode: 409
+```
+
+This confirmed that AWS authentication was working, but Terraform state was not being persisted between workflow runs.
+
+### S3 Backend
+
+The main Terraform configuration therefore uses an S3 remote backend:
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket = "<TERRAFORM_STATE_BUCKET>"
+    key    = "github-actions-oidc-ci/terraform.tfstate"
+    region = "ap-northeast-1"
+  }
+}
+```
+
+`terraform init` initializes the backend and retrieves the current state. After a successful `terraform apply`, Terraform writes the updated state back to S3 automatically.
+
+The workflow does **not** manually copy `terraform.tfstate` to or from S3.
+
+```text
+terraform init
+      |
+      v
+Read remote state from S3
+      |
+      v
+terraform plan
+      |
+      v
+Compare configuration + state + AWS
+      |
+      v
+terraform apply
+      |
+      v
+Write updated state to S3
+```
+
+### State History
+
+S3 Versioning is enabled on the backend bucket so previous versions of the state object can be retained for recovery.
+
+```hcl
+resource "aws_s3_bucket_versioning" "terraform_state" {
+  bucket = aws_s3_bucket.terraform_state.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+```
+
+Terraform state is not committed to Git. State files can contain infrastructure details and are operational data rather than source code.
 
 ## GitHub Actions Workflow
 
-The workflow runs when changes are pushed to `main` or when a pull request targets `main`.
+The workflow is triggered by pushes and pull requests targeting `main` and runs Terraform from the `terraform/` directory.
 
 ```text
 Push / Pull Request
         |
         v
-Checkout repository
+Checkout
         |
         v
 Setup Terraform
@@ -177,34 +290,25 @@ terraform plan
 terraform apply
 ```
 
-The Terraform commands run from the `terraform/` directory.
+For a production-style pipeline, `terraform apply` should normally be restricted to trusted deployment events such as a push/merge to `main`, while pull requests run validation and `terraform plan` only.
 
-## Bootstrap
+Example:
 
-OIDC authentication introduces a bootstrap dependency:
-
-```text
-GitHub Actions needs IAM Role
-        ^
-        |
-IAM Role needs to exist first
+```yaml
+- name: Terraform Apply
+  if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  run: terraform apply -auto-approve
 ```
-
-Therefore, the resources under `IAM_precreated/` are created first using an already authenticated Terraform environment.
-
-After the OIDC provider and IAM role exist, GitHub Actions can assume the role and manage the target infrastructure.
 
 ## Deployment
 
-### 1. Bootstrap the OIDC provider and IAM role
+### 1. Bootstrap OIDC, IAM, and the state backend
 
-Apply the configuration under:
+Run the Terraform configuration under:
 
 ```text
 IAM_precreated/
 ```
-
-For example:
 
 ```bash
 terraform init
@@ -229,112 +333,30 @@ Create:
 IAM_ROLE_ARN
 ```
 
-with the ARN of the IAM role created during bootstrap.
+with the complete IAM role ARN created during bootstrap.
 
-Example format:
+### 3. Configure the remote backend
 
-```text
-arn:aws:iam::<AWS_ACCOUNT_ID>:role/github-actions-terraform-role
-```
+Set the backend bucket name in `terraform/backend.tf` using the S3 bucket created during bootstrap.
 
-### 3. Push the Terraform configuration
+The public repository uses placeholders for account- and repository-specific values.
 
-Push changes to `main`.
+### 4. Push the Terraform configuration
 
-GitHub Actions will automatically run the Terraform workflow.
-
-## Verification
-
-After a successful workflow run, the S3 bucket can be verified with the AWS CLI:
-
-```bash
-aws s3 ls
-```
-
-Or verify a specific bucket:
-
-```bash
-aws s3api head-bucket \
-  --bucket <BUCKET_NAME>
-```
+Push changes to the repository. GitHub Actions requests an OIDC token, assumes the AWS IAM role, initializes the S3 backend, and runs the Terraform pipeline.
 
 ## Troubleshooting OIDC Authentication
 
 During development, the workflow initially failed with:
 
 ```text
-Not authorized to perform sts:AssumeRoleWithWebIdentity
-```
-
-The issue was isolated by inspecting the actual claims contained in the GitHub-issued OIDC JWT.
-
-The relevant claims included:
-
-```text
-aud: sts.amazonaws.com
-sub: repo:<owner>@<owner-id>/<repository>@<repository-id>:ref:refs/heads/main
-repository: <owner>/<repository>
-ref: refs/heads/main
-```
-
-The IAM trust policy must match the actual `aud` and `sub` claims issued by GitHub.
-
-This troubleshooting process helped verify the complete authentication path:
-
-```text
-GitHub Actions
-→ OIDC JWT
-→ AWS STS
-→ IAM Trust Policy
-→ IAM Role
-→ Temporary AWS credentials
-```
-
-## Security Notes
-
-This lab avoids storing long-lived AWS credentials in GitHub.
-
-OIDC provides short-lived credentials by allowing GitHub Actions to assume an IAM role only when the configured trust conditions are satisfied.
-
-For simplicity, the lab currently attaches:
-
-```text
-AmazonS3FullAccess
-```
-
-to the GitHub Actions IAM role.
-
-For production environments, this should be replaced with a least-privilege IAM policy limited to only the resources and actions required by the workflow.
-
-The OIDC subject condition can also be further restricted to specific branches or deployment environments.
-
-## Future Improvements
-
-Possible improvements include:
-
-- Replace `AmazonS3FullAccess` with a least-privilege IAM policy
-- Separate `terraform plan` and `terraform apply`
-- Run `plan` for pull requests and `apply` only after merge to `main`
-- Add GitHub Environment approval before production deployment
-- Store Terraform state in a remote backend
-- Add Terraform state locking
-- Add deployment notifications
-- Extend the pipeline to deploy additional AWS infrastructure
-  
-## Troubleshooting OIDC Authentication
-
-During development, the GitHub Actions workflow failed with:
-
-```text
 Could not assume role with OIDC:
 Not authorized to perform sts:AssumeRoleWithWebIdentity
 ```
 
-To isolate the cause, the authentication path was checked step by step.
+The authentication path was checked step by step instead of changing multiple settings at once.
 
 ### 1. Verify the IAM Role ARN
-
-First, verify the actual IAM Role ARN:
 
 ```powershell
 aws iam get-role `
@@ -343,23 +365,11 @@ aws iam get-role `
   --output text
 ```
 
-The ARN configured in GitHub Actions must match this value.
+The value passed to `role-to-assume` must be a complete IAM role ARN.
 
-To rule out a GitHub repository variable issue, the Role ARN can also be temporarily specified directly in the workflow:
-
-```yaml
-- name: Configure AWS credentials
-  uses: aws-actions/configure-aws-credentials@v6
-  with:
-    role-to-assume: arn:aws:iam::<AWS_ACCOUNT_ID>:role/github-actions-terraform-role
-    aws-region: ap-northeast-1
-```
-
-If the same error occurs with the ARN specified directly, the repository variable is not the cause.
+To isolate a repository-variable problem, the ARN can temporarily be supplied directly to the workflow. If the same STS error remains, the GitHub variable itself is not the cause.
 
 ### 2. Verify the IAM Role Trust Policy
-
-Check the trust policy currently applied to the IAM Role:
 
 ```powershell
 aws iam get-role `
@@ -368,7 +378,7 @@ aws iam get-role `
   --output json
 ```
 
-Confirm that:
+Check that:
 
 - `Principal.Federated` points to the GitHub OIDC provider
 - `Action` is `sts:AssumeRoleWithWebIdentity`
@@ -377,35 +387,30 @@ Confirm that:
 
 ### 3. Verify the GitHub OIDC Provider
 
-List the configured OIDC providers:
-
 ```powershell
 aws iam list-open-id-connect-providers `
   --output table
 ```
 
-Then inspect the GitHub provider:
+Then inspect the provider:
 
 ```powershell
 aws iam get-open-id-connect-provider `
   --open-id-connect-provider-arn "arn:aws:iam::<AWS_ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com"
 ```
 
-The expected configuration includes:
+Expected values include:
 
 ```text
-Url:
-token.actions.githubusercontent.com
-
-ClientIDList:
-sts.amazonaws.com
+Url: token.actions.githubusercontent.com
+ClientIDList: sts.amazonaws.com
 ```
 
 ### 4. Inspect the Actual GitHub OIDC JWT Claims
 
-If the IAM configuration appears correct but role assumption is still denied, inspect the actual OIDC claims issued by GitHub.
+If the AWS configuration appears correct but STS still rejects the request, the actual JWT claims can be inspected from the workflow.
 
-Add the following temporary step **before** `Configure AWS credentials`:
+Add this temporary step before `Configure AWS credentials`:
 
 ```yaml
 - name: Check OIDC claims
@@ -435,7 +440,7 @@ Add the following temporary step **before** `Configure AWS credentials`:
     PY
 ```
 
-Example output:
+Example sanitized output:
 
 ```text
 aud: sts.amazonaws.com
@@ -444,29 +449,9 @@ repository: <owner>/<repository>
 ref: refs/heads/main
 ```
 
-The complete JWT changes between token requests, but identity claims such as the repository owner ID and repository ID are used to identify the repository.
+The JWT itself is short-lived and changes between requests. The relevant repository identity in the `sub` claim must match the IAM trust policy.
 
-### 5. Compare the JWT Claims with the Trust Policy
-
-The actual `aud` and `sub` values must satisfy the IAM Role trust policy.
-
-Example:
-
-```hcl
-Condition = {
-  StringEquals = {
-    "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-  }
-
-  StringLike = {
-    "token.actions.githubusercontent.com:sub" = "repo:<owner>@<owner-id>/<repository>@<repository-id>:*"
-  }
-}
-```
-
-In this project, inspecting the JWT revealed that the actual GitHub OIDC `sub` did not match the value originally configured in the IAM trust policy.
-
-The troubleshooting process therefore isolated the issue as:
+### 5. Compare JWT Claims with the Trust Policy
 
 ```text
 GitHub Actions workflow      OK
@@ -482,6 +467,61 @@ IAM Trust Policy             DENIED
 sts:AssumeRoleWithWebIdentity failed
 ```
 
-After updating the IAM trust policy to match the actual GitHub OIDC subject, the workflow was able to assume the IAM Role successfully.
+In this lab, inspecting the actual JWT revealed that the `sub` claim did not match the subject originally configured in the IAM role trust policy. Updating the trust condition to match the actual GitHub OIDC subject resolved the role-assumption failure.
 
-> The `Check OIDC claims` step is intended for troubleshooting and can be removed after the trust relationship has been verified.
+The JWT inspection step is for troubleshooting and is removed or commented out after verification.
+
+## Troubleshooting Terraform State
+
+After OIDC authentication was fixed, a later workflow reached `terraform apply` but failed with:
+
+```text
+BucketAlreadyOwnedByYou
+StatusCode: 409
+```
+
+The important clue was:
+
+```text
+Plan: 1 to add, 0 to change, 0 to destroy
+```
+
+The target bucket already existed in AWS, but the new GitHub-hosted runner did not have the state created by the previous run.
+
+This separated the problem from authentication:
+
+```text
+OIDC token issuance          OK
+AWS STS role assumption      OK
+AWS API access               OK
+Terraform plan               OK
+        ↓
+State persistence            MISSING
+        ↓
+Terraform attempts recreate
+        ↓
+AWS returns 409
+```
+
+The solution is to persist state in the S3 remote backend rather than relying on runner-local state.
+
+## Security Notes
+
+- No long-lived AWS access keys are stored in GitHub.
+- GitHub Actions receives short-lived AWS credentials through OIDC and AWS STS.
+- The IAM trust policy restricts which GitHub identity can assume the role.
+- Repository/account-specific values are represented with placeholders in public Terraform examples where appropriate.
+- The actual IAM role ARN is supplied through a GitHub repository variable.
+- Terraform state is stored outside Git and the backend bucket has Versioning enabled.
+- The lab currently uses `AmazonS3FullAccess` for simplicity; a production environment should use least-privilege permissions for both the backend and deployed resources.
+
+## Future Improvements
+
+- Replace `AmazonS3FullAccess` with a least-privilege IAM policy
+- Restrict `terraform apply` to pushes/merges to `main`
+- Run validation and `terraform plan` only on pull requests
+- Add GitHub Environment approval before production deployment
+- Add state locking appropriate to the selected Terraform/S3 backend configuration
+- Encrypt and further harden the state backend
+- Add deployment notifications
+- Extend the pipeline to deploy additional AWS infrastructure
