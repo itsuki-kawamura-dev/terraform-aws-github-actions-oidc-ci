@@ -27,8 +27,7 @@ resource "aws_iam_role" "github_actions" {
                     "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
                 },
           StringLike = {
-            "token.actions.githubusercontent.com:sub" = "repo:<your-account-name>@<owner-id>/<repository>@<repositoryid>:*"
-                                              # example "repo:itsuki-kawamura-dev@1234567890/aaaaaaaaaaaa@1234567890:*"
+            "token.actions.githubusercontent.com:sub" = "repo:itsuki-kawamura-dev@319918486/terraform-aws-github-actions-oidc-ci@1364440312:*"
           }
         }
       }
