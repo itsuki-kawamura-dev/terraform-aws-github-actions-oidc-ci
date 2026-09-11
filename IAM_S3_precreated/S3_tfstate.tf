@@ -6,3 +6,11 @@ resource "aws_s3_bucket" "tfstate" {
     Project = "project3"
   }
 }
+
+resource "aws_s3_bucket_versioning" "terraform_state" {
+  bucket = aws_s3_bucket.tfstate.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}

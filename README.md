@@ -43,7 +43,7 @@ flowchart LR
 │   └── workflows/
 │       └── main.yml
 │
-├── IAM_precreated/
+├── IAM_S3_precreated/
 │   ├── IAM_OIDC.tf
 │   ├── backend_s3.tf
 │   └── output.tf
@@ -63,7 +63,7 @@ OIDC authentication and remote state both introduce bootstrap dependencies.
 
 GitHub Actions cannot assume the deployment IAM role until the GitHub OIDC provider and IAM role already exist. Likewise, Terraform cannot use an S3 backend until the backend bucket already exists.
 
-Therefore, the resources under `IAM_precreated/` are created first from an already authenticated local Terraform environment.
+Therefore, the resources under `IAM_S3_precreated/` are created first from an already authenticated local Terraform environment.
 
 The bootstrap layer creates:
 
@@ -307,7 +307,7 @@ Example:
 Run the Terraform configuration under:
 
 ```text
-IAM_precreated/
+IAM_S3_precreated/
 ```
 
 ```bash
