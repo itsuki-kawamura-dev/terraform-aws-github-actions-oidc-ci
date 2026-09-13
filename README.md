@@ -45,11 +45,11 @@ flowchart LR
 │
 ├── IAM_S3_precreated/
 │   ├── IAM_OIDC.tf
-│   ├── backend_s3.tf
+│   ├── S3_tfstate.tf
+│   ├── variables.tf
 │   └── output.tf
 │
 ├── terraform/
-│   ├── backend.tf
 │   ├── main.tf
 │   ├── variables.tf
 │   └── terraform.tfvars
